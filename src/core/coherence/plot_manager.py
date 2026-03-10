@@ -532,15 +532,20 @@ def analyze_plot_from_chapter(
 章节内容：
 {chapter_content[:2000]}
 
-请以JSON格式返回，包含以下字段：
+【重要】请以JSON格式返回，注意：
+1. 只返回JSON，不要有任何其他文字
+2. 确保JSON完整，不要中途截断
+3. 所有引号使用英文双引号"
+
+JSON格式：
 {{
     "plot_threads": [
         {{
-            "id": "唯一ID（如 main_1, side_2）",
+            "id": "唯一ID",
             "name": "剧情线名称",
-            "type": "类型（main/side/character/romance/mystery/conflict）",
+            "type": "main或side或character",
             "description": "简要描述",
-            "related_characters": ["角色1", "角色2"]
+            "related_characters": ["角色1"]
         }}
     ],
     "plot_events": [
@@ -563,13 +568,13 @@ def analyze_plot_from_chapter(
     ]
 }}
 
-只返回JSON，不要其他文字。"""
+现在请直接返回完整的JSON："""
 
     try:
         response = api_client.generate([
-            {"role": "system", "content": "你是一个专业的小说分析助手，擅长提取剧情信息。"},
+            {"role": "system", "content": "你是一个专业的小说分析助手。你必须只返回有效的JSON格式数据，不要添加任何其他文字。"},
             {"role": "user", "content": prompt}
-        ], temperature=0.3, max_tokens=2000)  # 增加max_tokens避免输出被截断
+        ], temperature=0.3, max_tokens=3000)  # 增加max_tokens到3000避免输出被截断
 
         # 清理响应：移除可能的 Markdown 代码块标记
         cleaned_response = response.strip()
@@ -650,13 +655,28 @@ def _parse_json_with_fallback(text: str, logger, context: str = "JSON解析"):
         except json.JSONDecodeError:
             return None
 
+    # 预处理：去除markdown标记和前后缀
+    cleaned = text.strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    elif cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    cleaned = cleaned.strip()
+
+    # 去除前缀文字
+    first_brace = cleaned.find('{')
+    if first_brace > 0:
+        cleaned = cleaned[first_brace:]
+
     # 第一次尝试：直接解析
-    result = try_parse(text)
+    result = try_parse(cleaned)
     if result:
         return result
 
     # 第二次尝试：替换中文标点符号
-    fixed = text
+    fixed = cleaned
     chinese_punct_map = {
         '"': '"',
         '"': '"',
@@ -677,28 +697,50 @@ def _parse_json_with_fallback(text: str, logger, context: str = "JSON解析"):
         return result
 
     # 第三次尝试：修复缺少逗号的问题
-    fixed = text
-    # 在 } 后面加逗号，如果后面是 " 而不是逗号
+    fixed = cleaned
     fixed = re.sub(r'}\s*"', '}, "', fixed)
-    # 在 ] 后面加逗号
     fixed = re.sub(r']\s*"', '], "', fixed)
+    fixed = re.sub(r',\s*\]', ']', fixed)
+    fixed = re.sub(r',\s*\}', '}', fixed)
     result = try_parse(fixed)
     if result:
         logger.warning(f"{context}: 通过修复逗号成功")
         return result
 
-    # 第四次尝试：提取JSON代码块
-    json_match = re.search(r'\{[\s\S]*\}', text)
+    # 第四次尝试：检测并修复截断的JSON
+    open_braces = cleaned.count('{')
+    close_braces = cleaned.count('}')
+    open_brackets = cleaned.count('[')
+    close_brackets = cleaned.count(']')
+
+    if open_braces != close_braces or open_brackets != close_brackets:
+        logger.info(f"{context}: 检测到JSON不完整，尝试修复截断")
+        
+        # 尝试补全缺失的括号
+        fixed = cleaned
+        # 补全缺失的 ]
+        missing_brackets = open_brackets - close_brackets
+        fixed += ']' * missing_brackets
+        # 补全缺失的 }
+        missing_braces = open_braces - close_braces
+        fixed += '}' * missing_braces
+        
+        result = try_parse(fixed)
+        if result:
+            logger.warning(f"{context}: 通过补全括号修复成功")
+            return result
+
+    # 第五次尝试：提取JSON代码块
+    json_match = re.search(r'\{[\s\S]*\}', cleaned)
     if json_match:
         result = try_parse(json_match.group(0))
         if result:
             logger.warning(f"{context}: 通过提取JSON块成功")
             return result
 
-    # 第五次尝试：使用更宽松的解析
+    # 第六次尝试：使用更宽松的解析
     try:
-        # 移除所有换行和多余空格后尝试
-        compact = re.sub(r'\s+', ' ', text.strip())
+        compact = re.sub(r'\s+', ' ', cleaned.strip())
         result = try_parse(compact)
         if result:
             logger.warning(f"{context}: 通过压缩空白成功")

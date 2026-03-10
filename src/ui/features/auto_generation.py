@@ -203,10 +203,11 @@ class AutoNovelGenerator:
         plot_idea: str,
         chapter_count: int,
         start_chapter_num: int,
-        previous_chapters: List[Dict]
+        previous_chapters: List[Dict],
+        max_retries: int = 3
     ) -> Tuple[bool, str, List[Dict]]:
         """
-        生成单批章节大纲
+        生成单批章节大纲（支持自动重试）
 
         Args:
             title: 小说标题
@@ -217,19 +218,26 @@ class AutoNovelGenerator:
             chapter_count: 本批章节数
             start_chapter_num: 起始章节号
             previous_chapters: 之前生成的章节列表（作为上下文）
+            max_retries: 最大重试次数（默认3次）
 
         Returns:
             (success, message, chapters)
         """
-        try:
-            # 构建上下文信息（所有已生成的章节）
-            context_info = ""
-            if previous_chapters:
-                context_info = f"\n\n前面已生成的章节（共{len(previous_chapters)}章，请基于这些章节继续往下生成）：\n"
-                for ch in previous_chapters:
-                    context_info += f"第{ch['num']}章：{ch['title']} - {ch['description']}\n"
+        last_error = ""
+        
+        for attempt in range(max_retries):
+            try:
+                if attempt > 0:
+                    logger.info(f"[自动重试] 第{attempt + 1}次尝试生成第{start_chapter_num}-{start_chapter_num + chapter_count - 1}章...")
+                
+                # 构建上下文信息（所有已生成的章节）
+                context_info = ""
+                if previous_chapters:
+                    context_info = f"\n\n前面已生成的章节（共{len(previous_chapters)}章，请基于这些章节继续往下生成）：\n"
+                    for ch in previous_chapters:
+                        context_info += f"第{ch['num']}章：{ch['title']} - {ch['description']}\n"
 
-            prompt = f"""请为一部{genre}小说生成大纲。
+                prompt = f"""请为一部{genre}小说生成大纲。
 
 小说标题：{title}
 
@@ -248,8 +256,14 @@ class AutoNovelGenerator:
 - 场景拆分格式：场景1-开场，场景2-发展，场景3-高潮，场景4-收尾
 - 确保剧情连贯，与前面章节自然衔接
 
-请严格按照以下JSON格式返回，不要添加任何其他文字、说明或markdown代码块标记：
+【重要】必须严格按照以下JSON格式返回，注意：
+1. 只返回JSON，不要有任何其他文字、说明或markdown标记
+2. 不要使用```json或```包裹
+3. 确保所有引号都是英文双引号"
+4. 确保JSON完整，不要中途截断
+5. 每个章节的scenes数组必须完整闭合
 
+JSON格式示例：
 {{
   "title": "{title}",
   "chapters": [
@@ -258,62 +272,76 @@ class AutoNovelGenerator:
       "title": "章节标题",
       "description": "章节描述",
       "scenes": [
-        {{"order": 1, "name": "开场", "purpose": "承接上文，引入本章"}},
-        {{"order": 2, "name": "发展", "purpose": "推进剧情，展开冲突"}},
-        {{"order": 3, "name": "高潮", "purpose": "本章重点，情感或行动高潮"}}
+        {{"order": 1, "name": "开场", "purpose": "承接上文"}},
+        {{"order": 2, "name": "发展", "purpose": "推进剧情"}},
+        {{"order": 3, "name": "高潮", "purpose": "本章重点"}},
+        {{"order": 4, "name": "收尾", "purpose": "本章结束"}}
       ]
     }}
   ]
 }}
 
-直接返回JSON，开头结尾都不要任何其他字符。"""
+现在请直接返回完整的JSON："""
 
-            # 调用API生成
-            logger.debug(f"调用API生成第{start_chapter_num}-{start_chapter_num + chapter_count - 1}章")
+                # 调用API生成
+                logger.debug(f"调用API生成第{start_chapter_num}-{start_chapter_num + chapter_count - 1}章")
 
-            # 限制max_tokens以避免API拒绝（某些API提供商限制max_tokens）
-            # 大纲生成需要足够的token，特别是多章批量生成时
-            # 10章大约需要30000-50000 tokens，这里限制为40000作为安全值
-            safe_max_tokens = min(self.outline_max_tokens, 40000)
-            logger.info(f"使用 max_tokens={safe_max_tokens} 生成大纲（配置值={self.outline_max_tokens}）")
+                # 限制max_tokens以避免API拒绝（某些API提供商限制max_tokens）
+                # 大纲生成需要足够的token，特别是多章批量生成时
+                # 10章大约需要30000-50000 tokens，这里限制为40000作为安全值
+                safe_max_tokens = min(self.outline_max_tokens, 40000)
+                logger.info(f"使用 max_tokens={safe_max_tokens} 生成大纲（配置值={self.outline_max_tokens}）")
 
-            response = self.api_client.generate([
-                {"role": "system", "content": "你是一个专业的小说大纲创作助手。"},
-                {"role": "user", "content": prompt}
-            ], temperature=0.7, max_tokens=safe_max_tokens)
+                response = self.api_client.generate([
+                    {"role": "system", "content": "你是一个专业的小说大纲创作助手。你必须只返回有效的JSON格式数据，不要添加任何其他文字。"},
+                    {"role": "user", "content": prompt}
+                ], temperature=0.7, max_tokens=safe_max_tokens)
 
-            if not response:
-                logger.error("API返回空响应")
-                return False, "AI返回空响应", []
+                if not response:
+                    last_error = "AI返回空响应"
+                    logger.error(f"API返回空响应（第{attempt + 1}次尝试）")
+                    continue
 
-            logger.debug(f"API响应长度: {len(response)} 字符")
+                logger.debug(f"API响应长度: {len(response)} 字符")
 
-            # 解析JSON响应（复用之前的解析逻辑）
-            result = self._parse_outline_response(response)
-            if not result:
-                return False, "无法解析AI返回的大纲（JSON格式错误）", []
+                # 解析JSON响应（复用之前的解析逻辑）
+                result = self._parse_outline_response(response)
+                if not result:
+                    last_error = "无法解析AI返回的大纲（JSON格式错误）"
+                    logger.warning(f"JSON解析失败（第{attempt + 1}次尝试），准备重试...")
+                    continue
 
-            # 验证章节号是否正确
-            chapters = result.get("chapters", [])
-            if not chapters:
-                return False, "返回的大纲没有章节信息", []
+                # 验证章节号是否正确
+                chapters = result.get("chapters", [])
+                if not chapters:
+                    last_error = "返回的大纲没有章节信息"
+                    logger.warning(f"大纲没有章节信息（第{attempt + 1}次尝试），准备重试...")
+                    continue
 
-            # 确保章节号正确
-            for i, ch in enumerate(chapters):
-                expected_num = start_chapter_num + i
-                if ch['num'] != expected_num:
-                    logger.warning(f"章节号不匹配: 期望{expected_num}，实际{ch['num']}，自动修正")
-                    ch['num'] = expected_num
+                # 确保章节号正确
+                for i, ch in enumerate(chapters):
+                    expected_num = start_chapter_num + i
+                    if ch['num'] != expected_num:
+                        logger.warning(f"章节号不匹配: 期望{expected_num}，实际{ch['num']}，自动修正")
+                        ch['num'] = expected_num
 
-            return True, "生成成功", chapters
+                # 成功！
+                if attempt > 0:
+                    logger.info(f"[自动重试成功] 第{attempt + 1}次尝试成功，生成了{len(chapters)}章")
+                return True, "生成成功", chapters
 
-        except Exception as e:
-            logger.error(f"生成批次大纲失败: {e}")
-            return False, f"生成失败: {str(e)}", []
+            except Exception as e:
+                last_error = str(e)
+                logger.error(f"生成批次大纲失败（第{attempt + 1}次尝试）: {e}")
+                continue
+
+        # 所有重试都失败
+        logger.error(f"[自动重试失败] 已尝试{max_retries}次，全部失败。最后错误: {last_error}")
+        return False, f"生成失败（已重试{max_retries}次）: {last_error}", []
 
     def _parse_outline_response(self, response: str) -> Optional[Dict]:
         """
-        解析大纲API响应
+        解析大纲API响应（增强版，多层级清理和修复）
 
         Args:
             response: API返回的原始响应
@@ -323,66 +351,93 @@ class AutoNovelGenerator:
         """
         import re
 
+        # ========== 第1步：预处理 ==========
+        # 清理响应内容
+        cleaned_response = response.strip()
+
+        # 1.1 去除可能的markdown代码块标记
+        if cleaned_response.startswith("```json"):
+            cleaned_response = cleaned_response[7:]
+        elif cleaned_response.startswith("```"):
+            cleaned_response = cleaned_response[3:]
+        if cleaned_response.endswith("```"):
+            cleaned_response = cleaned_response[:-3]
+        cleaned_response = cleaned_response.strip()
+
+        # 1.2 去除可能的前缀文字（如"好的，这是大纲："）
+        # 查找第一个 { 的位置
+        first_brace = cleaned_response.find('{')
+        if first_brace > 0:
+            prefix = cleaned_response[:first_brace].strip()
+            if prefix:
+                logger.debug(f"去除前缀文字: {prefix[:50]}...")
+            cleaned_response = cleaned_response[first_brace:]
+
+        # 1.3 去除可能的后缀文字
+        # 找到最后一个 } 的位置
+        last_brace = cleaned_response.rfind('}')
+        if last_brace != -1 and last_brace < len(cleaned_response) - 1:
+            suffix = cleaned_response[last_brace + 1:].strip()
+            if suffix:
+                logger.debug(f"去除后缀文字: {suffix[:50]}...")
+            cleaned_response = cleaned_response[:last_brace + 1]
+
+        # 1.4 修复中文引号（这是JSON解析失败的主要原因）
+        cleaned_response = cleaned_response.replace('"', '"').replace('"', '"')
+        cleaned_response = cleaned_response.replace(''', "'").replace(''', "'")
+
+        # 1.5 修复常见的JSON格式问题
+        # 修复缺少逗号的情况（如 "title": "xxx" "description": "yyy"）
+        cleaned_response = re.sub(r'"\s*\n\s*"', '",\n"', cleaned_response)
+        # 修复多余的逗号（如数组最后一个元素后的逗号）
+        cleaned_response = re.sub(r',\s*\]', ']', cleaned_response)
+        cleaned_response = re.sub(r',\s*\}', '}', cleaned_response)
+
+        # ========== 第2步：尝试直接解析 ==========
         try:
-            result = json.loads(response)
+            result = json.loads(cleaned_response)
             logger.info("直接解析JSON成功")
             return result
         except json.JSONDecodeError as je:
-            logger.warning(f"直接解析JSON失败: {je}，尝试清理和提取JSON")
+            logger.warning(f"直接解析JSON失败: {je}，尝试进一步修复")
 
-            # 清理响应内容
-            cleaned_response = response.strip()
+        # ========== 第3步：尝试修复截断的JSON ==========
+        # 检测是否是截断问题（JSON不完整）
+        open_braces = cleaned_response.count('{')
+        close_braces = cleaned_response.count('}')
+        open_brackets = cleaned_response.count('[')
+        close_brackets = cleaned_response.count(']')
 
-            # 去除可能的markdown代码块标记
-            if cleaned_response.startswith("```json"):
-                cleaned_response = cleaned_response[7:]
-            elif cleaned_response.startswith("```"):
-                cleaned_response = cleaned_response[3:]
-            if cleaned_response.endswith("```"):
-                cleaned_response = cleaned_response[:-3]
-            cleaned_response = cleaned_response.strip()
+        if open_braces != close_braces or open_brackets != close_brackets:
+            logger.info(f"检测到JSON不完整: {{ = {open_braces}/{close_braces}, [ = {open_brackets}/{close_brackets}，尝试修复截断")
+            
+            # 尝试修复截断的JSON
+            repaired_json = self._repair_truncated_json(cleaned_response)
+            if repaired_json:
+                try:
+                    result = json.loads(repaired_json)
+                    actual_chapters = len(result.get('chapters', []))
+                    logger.info(f"成功修复截断的JSON，保留了{actual_chapters}章")
+                    return result
+                except json.JSONDecodeError as repair_error:
+                    logger.error(f"修复后的JSON仍然无法解析: {repair_error}")
 
-            # 修复中文引号（这是JSON解析失败的主要原因）
-            # 将中文引号 "" 替换为英文引号 ""
-            cleaned_response = cleaned_response.replace('"', '"').replace('"', '"')
-            # 将中文单引号 '' 替换为英文单引号 '
-            cleaned_response = cleaned_response.replace(''', "'").replace(''', "'")
-
-            # 尝试解析清理后的响应
+        # ========== 第4步：尝试正则提取 ==========
+        json_match = re.search(r'\{[\s\S]*\}', cleaned_response)
+        if json_match:
+            json_str = json_match.group(0)
             try:
-                result = json.loads(cleaned_response)
-                logger.info("清理后成功解析JSON（包含中文引号修复）")
+                result = json.loads(json_str)
+                logger.info("通过正则提取成功解析JSON")
                 return result
-            except json.JSONDecodeError:
-                # 尝试提取JSON部分（使用正则表达式）
-                json_match = re.search(r'\{[\s\S]*\}', cleaned_response)
-                if json_match:
-                    json_str = json_match.group(0)
-                    try:
-                        result = json.loads(json_str)
-                        logger.info("通过正则提取成功解析JSON")
-                        return result
-                    except json.JSONDecodeError as je3:
-                        logger.error(f"正则提取后仍然解析失败: {je3}")
-                        logger.error(f"原始响应（前1000字符）: {response[:1000]}")
+            except json.JSONDecodeError as je3:
+                logger.error(f"正则提取后仍然解析失败: {je3}")
 
-                        # 尝试修复截断的JSON
-                        logger.info("尝试修复截断的JSON...")
-                        repaired_json = self._repair_truncated_json(json_str)
-                        if repaired_json:
-                            try:
-                                result = json.loads(repaired_json)
-                                actual_chapters = len(result.get('chapters', []))
-                                logger.info(f"成功修复截断的JSON，保留了{actual_chapters}章")
-                                return result
-                            except json.JSONDecodeError:
-                                pass
-
-                        return None
-                else:
-                    logger.error(f"无法找到JSON格式")
-                    logger.error(f"原始响应（前1000字符）: {response[:1000]}")
-                    return None
+        # ========== 第5步：所有尝试都失败 ==========
+        logger.error(f"所有JSON解析尝试都失败")
+        logger.error(f"原始响应（前1000字符）: {response[:1000]}")
+        logger.error(f"清理后响应（前1000字符）: {cleaned_response[:1000]}")
+        return None
 
     def _repair_truncated_json(self, json_str: str) -> Optional[str]:
         """
@@ -405,35 +460,75 @@ class AutoNovelGenerator:
                 inner_content = inner_content[:-1]
 
             # 找到所有的章节对象
-            # 模式：{"num": X, "title": "...", "description": "..."}
-            chapter_pattern = r'\{\s*"num"\s*:\s*\d+,\s*"title"\s*:\s*"[^"]*"\s*,\s*"description"\s*:\s*"[^"]*"(?:\s*\}\s*)?'
-
-            matches = list(re.finditer(chapter_pattern, inner_content))
-
-            if not matches:
-                return None
-
-            # 使用所有找到的完整章节重建JSON
+            # 改进的正则：匹配包含scenes数组的完整章节对象
+            # 策略：找到每个章节的开始标记 "num": X，然后找到对应的完整对象
             chapters = []
-            for match in matches:
-                chapter_str = match.group(0)
-                # 确保章节对象有闭合的 }
-                if chapter_str.rstrip().endswith('}'):
-                    chapters.append(chapter_str.rstrip())
-                else:
-                    # 尝试找到闭合位置
-                    closing_pos = chapter_str.rfind('}')
-                    if closing_pos != -1:
-                        chapters.append(chapter_str[:closing_pos + 1].rstrip())
+            
+            # 方法1：尝试匹配完整的章节对象（包含scenes）
+            # 使用更灵活的模式，匹配到scenes数组结束
+            chapter_pattern_with_scenes = r'\{\s*"num"\s*:\s*\d+,\s*"title"\s*:\s*"[^"]*",\s*"description"\s*:\s*"[^"]*",\s*"scenes"\s*:\s*\[[\s\S]*?\]\s*\}'
+            matches = list(re.finditer(chapter_pattern_with_scenes, inner_content))
+            
+            if matches:
+                logger.info(f"使用完整章节模式匹配到 {len(matches)} 个章节")
+                for match in matches:
+                    chapter_str = match.group(0).strip()
+                    # 验证是否是有效的JSON
+                    try:
+                        json.loads(chapter_str)
+                        chapters.append(chapter_str)
+                    except json.JSONDecodeError:
+                        continue
+            
+            # 方法2：如果方法1没有匹配到，尝试逐个解析章节
+            if not chapters:
+                logger.info("尝试逐个解析章节...")
+                # 找到所有章节的开始位置
+                chapter_starts = list(re.finditer(r'\{\s*"num"\s*:\s*(\d+)', inner_content))
+                
+                for i, start_match in enumerate(chapter_starts):
+                    start_pos = start_match.start()
+                    # 确定结束位置（下一个章节开始，或字符串结束）
+                    if i + 1 < len(chapter_starts):
+                        end_pos = chapter_starts[i + 1].start()
+                    else:
+                        end_pos = len(inner_content)
+                    
+                    chapter_segment = inner_content[start_pos:end_pos].strip()
+                    
+                    # 尝试找到完整的章节对象
+                    # 查找最后一个完整的 }
+                    brace_count = 0
+                    last_valid_pos = -1
+                    for pos, char in enumerate(chapter_segment):
+                        if char == '{':
+                            brace_count += 1
+                        elif char == '}':
+                            brace_count -= 1
+                            if brace_count == 0:
+                                last_valid_pos = pos + 1
+                                break
+                    
+                    if last_valid_pos > 0:
+                        chapter_str = chapter_segment[:last_valid_pos].strip()
+                        try:
+                            # 验证是否是有效的JSON
+                            parsed = json.loads(chapter_str)
+                            if 'num' in parsed and 'title' in parsed:
+                                chapters.append(chapter_str)
+                                logger.debug(f"成功解析章节: 第{parsed['num']}章")
+                        except json.JSONDecodeError:
+                            continue
 
             if not chapters:
+                logger.warning("无法从截断的JSON中提取任何有效章节")
                 return None
 
             # 重建JSON
             chapters_json = ",\n    ".join(chapters)
             repaired_json = f'{{\n  "title": "Generated Outline",\n  "chapters": [\n    {chapters_json}\n  ]\n}}'
 
-            logger.info(f"修复截断JSON：原JSON长度={len(json_str)}，修复后={len(repaired_json)}，章节数={len(chapters)}")
+            logger.info(f"修复截断JSON：原JSON长度={len(json_str)}，修复后={len(repaired_json)}，成功提取{len(chapters)}章")
             return repaired_json
 
         except Exception as e:
@@ -1028,21 +1123,21 @@ class AutoNovelGenerator:
             重写后的内容，失败返回None
         """
         try:
+            # 计算max_tokens（使用目标字数和当前的token系数）
+            # 重写时使用相同的token设置，确保字数一致
+            base_max_tokens = int(target_words * 1.2)  # 基础token
+            adjusted_max_tokens = int(base_max_tokens * self.token_adjustment_factor)
+            
             # 构建上下文
             context_text, use_summary = self._build_smart_context(
                 project_id=project_id,
                 chapter_num=chapter_num,
                 previous_chapters=previous_chapters,
-                max_tokens_limit=self.api_client.max_tokens
+                max_tokens_limit=adjusted_max_tokens
             )
             
             # 获取提示词模板
             prompt_template = self.prompt_manager.get_prompt("chapter_generation")
-            
-            # 计算max_tokens（使用目标字数和当前的token系数）
-            # 重写时使用相同的token设置，确保字数一致
-            base_max_tokens = int(target_words * 1.2)  # 基础token
-            adjusted_max_tokens = int(base_max_tokens * self.token_adjustment_factor)
             
             logger.info(f"[自动重写] 第{attempt}次尝试 - max_tokens={adjusted_max_tokens} (系数: {self.token_adjustment_factor:.3f})")
             
