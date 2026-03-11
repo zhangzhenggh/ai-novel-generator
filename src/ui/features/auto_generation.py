@@ -176,13 +176,35 @@ class AutoNovelGenerator:
 
                     logger.info(f"[自动生成] 生成第{batch_num + 1}/{total_batches}批: 第{start_chapter}-{end_chapter}章（共{current_batch_size}章）")
 
-                    success, message, chapters = self._generate_single_batch(
-                        title, genre, char_setting_short, world_setting_short,
-                        plot_idea_short, current_batch_size, start_chapter, all_chapters
-                    )
+                    # 容错机制：失败时逐步减少章节数重试，直到成功
+                    fallback_sizes = [current_batch_size]
+                    if current_batch_size >= 10:
+                        fallback_sizes = [10, 5, 3, 2, 1]
+                    elif current_batch_size >= 5:
+                        fallback_sizes = [5, 3, 2, 1]
+                    elif current_batch_size >= 3:
+                        fallback_sizes = [3, 2, 1]
+                    else:
+                        fallback_sizes = [current_batch_size]
 
+                    success = False
+                    message = ""
+                    chapters = []
+                    for try_size in fallback_sizes:
+                        logger.info(f"[自动生成] 尝试生成{try_size}章（第{start_chapter}-{start_chapter + try_size - 1}章）")
+                        success, message, chapters = self._generate_single_batch(
+                            title, genre, char_setting_short, world_setting_short,
+                            plot_idea_short, try_size, start_chapter, all_chapters
+                        )
+                        if success:
+                            logger.info(f"[自动生成] 第{batch_num + 1}批成功（{try_size}章），已累计生成{len(all_chapters) + len(chapters)}章")
+                            break
+                        else:
+                            logger.warning(f"[自动生成] 生成{try_size}章失败: {message}，尝试减少章节数")
+
+                    # 确保本批成功，否则终止
                     if not success:
-                        return False, f"第{batch_num + 1}批生成失败: {message}", all_chapters
+                        return False, f"第{batch_num + 1}批最终失败: {message}", all_chapters
 
                     all_chapters.extend(chapters)
                     logger.info(f"[自动生成] 第{batch_num + 1}批生成成功，已累计生成{len(all_chapters)}章")
@@ -204,7 +226,7 @@ class AutoNovelGenerator:
         chapter_count: int,
         start_chapter_num: int,
         previous_chapters: List[Dict],
-        max_retries: int = 3
+        max_retries: int = 5  # 增加重试次数
     ) -> Tuple[bool, str, List[Dict]]:
         """
         生成单批章节大纲（支持自动重试）
@@ -283,14 +305,21 @@ JSON格式示例：
 
 现在请直接返回完整的JSON："""
 
+                # AI自我重试提示（仅在重试时添加）
+                if attempt > 0:
+                    retry_hint = f"\n\n【重要提醒】上次生成失败（{last_error}），请务必：\n1. 确保生成完整的JSON，不要截断\n2. 每个章节的scenes数组必须完整闭合\n3. 检查所有括号和引号是否配对\n"
+                    prompt = prompt + retry_hint
+
                 # 调用API生成
                 logger.debug(f"调用API生成第{start_chapter_num}-{start_chapter_num + chapter_count - 1}章")
 
-                # 限制max_tokens以避免API拒绝（某些API提供商限制max_tokens）
-                # 大纲生成需要足够的token，特别是多章批量生成时
-                # 10章大约需要30000-50000 tokens，这里限制为40000作为安全值
-                safe_max_tokens = min(self.outline_max_tokens, 40000)
-                logger.info(f"使用 max_tokens={safe_max_tokens} 生成大纲（配置值={self.outline_max_tokens}）")
+                # 完全动态计算token，不依赖全局配置
+                # 每章约3500-4000 tokens输出（包含4个场景的JSON）
+                tokens_per_chapter = 4000
+                required_tokens = chapter_count * tokens_per_chapter
+                # 不再使用全局outline_max_tokens，完全根据章节数动态计算
+                safe_max_tokens = required_tokens
+                logger.info(f"使用 max_tokens={safe_max_tokens} 生成{chapter_count}章（每章约{tokens_per_chapter} tokens）")
 
                 response = self.api_client.generate([
                     {"role": "system", "content": "你是一个专业的小说大纲创作助手。你必须只返回有效的JSON格式数据，不要添加任何其他文字。"},
@@ -1133,7 +1162,7 @@ JSON格式示例：
                 project_id=project_id,
                 chapter_num=chapter_num,
                 previous_chapters=previous_chapters,
-                max_tokens_limit=adjusted_max_tokens
+                max_tokens=adjusted_max_tokens
             )
             
             # 获取提示词模板

@@ -1,0 +1,16 @@
+{
+  "providers": [
+    {
+      "id": "zhipu_20260311190243",
+      "provider_id": "zhipu",
+      "name": "智谱AI (GLM)",
+      "api_key": "e8a63d808d9c4b14aa6589bc2b36a951.RaBfBpFj46yHdJoJ",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4/",
+      "model": "glm-4.5-air",
+      "timeout": 480,
+      "max_retries": 8,
+      "enabled": true,
+      "created_at": "2026-03-11T19:02:43.925084"
+    }
+  ]
+}
